@@ -42,6 +42,8 @@
 #include <pcl/filters/approximate_voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/console/parse.h>
+ #include <pcl/common/common.h>
+#include <pcl_conversions/pcl_conversions.h>
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/core.hpp>
@@ -53,9 +55,11 @@
 #include <image_transport/image_transport.h>
 #include <camera_info_manager/camera_info_manager.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
-#include <geometry_msgs/Polygon.h>
+#include <geometry_msgs/PointStamped.h>
+#include <cv_bridge/cv_bridge.h>
+#include <pcl_ros/transforms.h>
 
-#include<object_tracker/object_tracker.h>
+//#include<object_tracker/object_tracker.h>
 
 using namespace std;
 using namespace sensor_msgs;
@@ -64,24 +68,25 @@ using namespace pcl::tracking;
 
 typedef cv::CascadeClassifier ClassifierT;
 typedef cv::Mat ImageT;
-typedef cv_bridge::CvImageConstPtr ImagePtr;
+typedef cv_bridge::CvImageConstPtr ImagePtrT;
 typedef cv::Rect_<int> RectangleT;
 
-typedef pcl::ParticleXYZRPY ParticleT;
+typedef ParticleXYZRPY ParticleT;
 typedef pcl::PointXYZRGB PointT;
 typedef std::vector<PointT, Eigen::aligned_allocator<PointT>> PointsT;
 typedef pcl::PointCloud<PointT> PointCloudT;
-typedef PointCloudT::Ptr PointCloudPtr;
-typedef PointCloudT::ConstPtr PointCloudConstPtr;
+typedef PointCloudT::Ptr PointCloudPtrT;
+typedef PointCloudT::ConstPtr PointCloudConstPtrT;
 
 typedef ParticleFilterTracker<PointT, ParticleT> ParticleFilterT;
+typedef ParticleFilterT::PointCloudStatePtr ParticleCloudPtrT;
 typedef KLDAdaptiveParticleFilterOMPTracker<PointT, ParticleT> KLDParticleFilterT;
 
 
 
 struct PointCloudDataT
 {
-	PointCloudPtr cloud_ptr;
+	PointCloudPtrT cloud_ptr;
 	int r_avg = 0;
 	int g_avg = 0;
 	int b_avg = 0;
@@ -98,39 +103,46 @@ struct PointCloudDataT
 
 class object_tracker
 {
-   classifierT object_detector;
+   ClassifierT object_detector;
 
    ros::Subscriber image_subscriber ; 
-   ros::Subscriber pointcloud_subscriber ; 
+   ros::Subscriber point_cloud_subscriber ; 
+
+   ros::Publisher object_cloud_pub,object_centroid_pub,tracked_cloud_pub;
 
    bool image_initialized = false;
-   bool pointcloud_initialized = false;
+   bool point_cloud_initialized = false;
 
    bool object_detected = false;
 
-   PointCloudPtr input_pointcloud;
-   PointCloudPtr object_pointcloud;
+   PointCloudPtrT input_point_cloud ;
+   PointCloudPtrT object_point_cloud;
+   PointCloudPtrT tracked_point_cloud;
+   PointCloudPtrT target_point_cloud;
+   PointCloudPtrT object_particle_cloud;
 
    ImageT input_image;
    ImageT input_image_grayscale;
-   ImagePtr input_image_ptr;
+   ImagePtrT input_image_ptr;
 
    RectangleT ref_object_rect;
 
    int input_image_height = 0;
    int input_image_width = 0;
 
-   double depth_offset;
-   double length_offset;
-   double height_offset;
+   double depth_offset,length_offset,height_offset,object_offset;
+   double prev_x, prev_y, prev_z;
 
-   struct PointCloudDataT target_cloud_data;
+
+   PointCloudDataT target_cloud_data;
 
    boost::shared_ptr<ParticleFilterT> particle_tracker;
-ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence; 
+   ApproxNearestPairPointCloudCoherence<PointT>::Ptr coherence; 
+
+   geometry_msgs::PointStamped object_centroid_msg;
       
    public :
-	void object_tracker(ClassifierT detector, string image_topic, string pointcloud_topic,Eigen::Vector4f offset)
+	object_tracker(ClassifierT detector, string image_topic, string point_cloud_topic,Eigen::Vector4f offset)
 	{
 		ros::NodeHandle nh;
 	
@@ -139,10 +151,24 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 		length_offset = offset[0];
 		height_offset = offset[1]; 
 		depth_offset = offset[2];
+		object_offset = offset[3];
+
+//		*input_point_cloud = new PointCloudT();
+//   		*object_point_cloud = new PointCloudT();
+//   		*tracked_point_cloud = new PointCloudT();
+//  		*target_point_cloud = new PointCloudT();
+//   		*object_particle_cloud = new PointCloudT ();
 
 		image_subscriber =  nh.subscribe(image_topic, 1, &object_tracker::image_callback, this);
 
-		pointcloud_subscriber =  nh.subscribe(pointcloud_topic, 1, &object_tracker::pointcloud_callback, this);	
+		point_cloud_subscriber =  nh.subscribe(point_cloud_topic, 1, &object_tracker::point_cloud_callback, this);
+
+		object_cloud_pub = nh.advertise<sensor_msgs::PointCloud2> (point_cloud_topic+"/object_cloud", 1); 
+
+		tracked_cloud_pub = nh.advertise<sensor_msgs::PointCloud2> (point_cloud_topic+"/tracked_cloud", 1); 	
+
+	        object_centroid_pub = nh.advertise<geometry_msgs::PointStamped> (point_cloud_topic+"/object_centroid", 1);
+
 	}
 
 	 void image_callback(const sensor_msgs::ImageConstPtr& image )
@@ -168,38 +194,41 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 		
 	}
 
-	 void pointcloud_callback( const sensor_msgs::PointCloud2ConstPtr& pointcloud )
+	 void point_cloud_callback( const sensor_msgs::PointCloud2ConstPtr& point_cloud )
   	{
 	
 		try
 		{
-			pcl::fromROSMsg (*pointcloud, *input_pointcloud);
+			pcl::fromROSMsg (*point_cloud, *input_point_cloud);
 		}
 
 		catch(const std::exception& e)
 		{
-			ROS_ERROR("pointcloud_callback exception: %s", e.what());
-			pointcloud_initialized = false;
+			ROS_ERROR("point_cloud_callback exception: %s", e.what());
+			point_cloud_initialized = false;
 	      		return;
 		}
 
 		catch(...)
 		{
-			ROS_ERROR("Unexpected expection in pointcloud_callback");
-			pointcloud_initialized = false;
+			ROS_ERROR("Unexpected expection in point_cloud_callback");
+			point_cloud_initialized = false;
 	      		return;
 		}
 
-		pointcloud_initialized = true;
+		point_cloud_initialized = true;
+
+		run();
 	}
 
 
-	bool object_detection()
+	bool object_detection(bool redetect = false)
 	{
-		if(image_initialized && pointcloud_initialized)
+		if(image_initialized && point_cloud_initialized)
 		{
 			std::vector<RectangleT> objects;
-			input_image_grayscale = ImageT(image_height,image_width, CV8UC3,cv::Scalar(0, 0, 0));
+			input_image_grayscale = ImageT(input_point_cloud->height,input_point_cloud->width, CV_8UC1,cv::Scalar(0, 0, 0));
+			cvtColor(input_image, input_image_grayscale, CV_BGR2GRAY);
 			object_detector.detectMultiScale(input_image_grayscale, objects);
 
 			if(!object_detected)
@@ -210,9 +239,9 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
     			    {
 				int area = object.width * object.height;
 	
-				struct PointCloudDataT extracted_cloud_data;
+				PointCloudDataT extracted_cloud_data;
 
-				extracted_cloud_data = extract_cloud(object)
+				extracted_cloud_data = extract_cloud(object);
 
 				if(extracted_cloud_data.is_valid)
 				{
@@ -225,9 +254,14 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 				}								
 			     }
 			}
-			else
-			{
-			}		
+		
+		}
+
+		else
+		{
+
+			object_detected = false;
+
 		}
 
 		return object_detected;			
@@ -240,19 +274,19 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 
 		float object_depth[5];
 	
-		struct PointCloudDataT ref_cloud_data;
+		PointCloudDataT ref_cloud_data;
 		
-		ref_cloud_data.cloud_ptr(new PointCloudT ());
+//		ref_cloud_data.cloud_ptr(new PointCloudT ());
 
-		int cloud_width = input_pointcloud->width;
-		int cloud_height = input_pointcloud->height;
+		int cloud_width = input_point_cloud->width;
+		int cloud_height = input_point_cloud->height;
 
 		int center_x = ref_rect.x + ref_rect.width/2 ;
 		int center_y = ref_rect.y + ref_rect.height/2 ;
 
 		double center_object_depth = 0.0;
 
-		PointsT input_points = input_pointcloud->points;
+		PointsT input_points = input_point_cloud->points;
 
 		object_depth[0]	= input_points.at(center_x + center_y*cloud_width).z;
 		object_depth[1]	= input_points.at(center_x + 1 + center_y*cloud_width).z;
@@ -269,8 +303,8 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 
 		}
 
-		double min_z_value = center_object_depth - depth_offset;
-		double max_z_value = center_object_depth + depth_offset;
+		double min_z_value = center_object_depth - object_offset;
+		double max_z_value = center_object_depth + object_offset;
 
 		PointT input_point;
 	
@@ -290,7 +324,7 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 					g_value = input_point.g ;
 					b_value = input_point.b ;
 				
-					if(z_value >= min_z_value && z_value <= max_z_value )
+					if(center_object_depth >= min_z_value && center_object_depth <= max_z_value )
 					{	
 						ref_cloud_data.r_avg += r_value;
 						ref_cloud_data.g_avg += g_value;
@@ -317,6 +351,10 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 			ref_cloud_data.y_center = ref_cloud_centroid[1];
 			ref_cloud_data.z_center = ref_cloud_centroid[2];
 
+			prev_x = ref_cloud_centroid[0];
+			prev_y = ref_cloud_centroid[1];
+			prev_z = ref_cloud_centroid[2];
+
 			PointT point_min;
 			PointT point_max;
 
@@ -326,7 +364,8 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 			ref_cloud_data.breadth = abs( point_max.z - point_min.z );
 			ref_cloud_data.height = abs( point_max.y - point_min.y );
 		
-			ref_cloud_data.is_valid = true;			
+			ref_cloud_data.is_valid = true;	
+		
 		
 		}
 
@@ -339,7 +378,7 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 
 	} 
 
-	void downsample(const PointCloudConstPtr &cloud, PointCloudT &result, double leaf_size)
+	void downsample(const PointCloudConstPtrT &cloud, PointCloudT &result, double leaf_size)
 	{
 
 		//Downsample
@@ -354,7 +393,7 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 
 	 // Particle Filter Initialization
 
-	  downsampling_grid_size_ =  0.01;
+	  float downsampling_grid_size =  0.01;
 
 	  std::vector<double> default_step_covariance = std::vector<double> (6, 0.015 * 0.015);
 	  default_step_covariance[3] *= 40.0;
@@ -419,33 +458,31 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 	  Eigen::Vector4f c;
 	  Eigen::Affine3f transform = Eigen::Affine3f::Identity ();
 
-	  PointCloudPtr transformed_cloud (new PointCloudT());
-	  PointCloudPtr transformed_cloud_downsampled (new PointCloudT());
+	  PointCloudPtrT transformed_cloud (new PointCloudT());
+	  PointCloudPtrT transformed_cloud_downsampled (new PointCloudT());
 
-	  pcl::compute3DCentroid<PointT> (*target_cloud, c);
+	  pcl::compute3DCentroid<PointT> (*target_point_cloud, c);
 	  transform.translation ().matrix () = Eigen::Vector3f (c[0], c[1], c[2]);
-	  pcl::transformPointCloud<PointT> (*target_cloud, *transformed_cloud, transform.inverse());
+	  pcl::transformPointCloud<PointT> (*target_point_cloud, *transformed_cloud, transform.inverse());
 
-	  downsample(transformed_cloud, *transformed_cloud_downsampled, downsampling_grid_size_);
+	  downsample(transformed_cloud, *transformed_cloud_downsampled, downsampling_grid_size);
 
 	  //set reference model and trans
 	  particle_tracker->setReferenceCloud (transformed_cloud_downsampled);
-	  particle_tracker->setTrans (trans);
+	  particle_tracker->setTrans (transform);
 
 	}
 
 
-	PointCloudDataT crop_cloud(const PointCloudConstPtr &cloud, double x_prev, double y_prev, double z_prev)
+	PointCloudDataT crop_cloud(const PointCloudConstPtrT &cloud, double x_prev, double y_prev, double z_prev)
 	{
 
 		int r_value, g_value ,b_value;
 		double x_value,y_value,z_value;
-
-		float object_depth[5];
 	
-		struct PointCloudDataT cropped_cloud_data;
+		PointCloudDataT cropped_cloud_data;
 		
-		cropped_cloud_data.cloud_ptr(new PointCloudT ());
+		//cropped_cloud_data.cloud_ptr(new PointCloudT ());
 
 		int cloud_width = cloud->width;
 		int cloud_height = cloud->height;
@@ -456,9 +493,23 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 		double min_y_value = y_prev - height_offset ;
 		double max_y_value = y_prev + height_offset ;
 
+		double min_z_value = z_prev - depth_offset ;
+		double max_z_value = z_prev + depth_offset ;
+
+		double min_center_x_value = x_prev - object_offset/2.0 ;
+		double max_center_x_value = x_prev + object_offset/2.0 ;
+
+		double min_center_y_value = y_prev - object_offset/2.0;
+		double max_center_y_value = y_prev + object_offset/2.0 ;
+
+
 		double center_object_depth = 0.0;
 
 		PointsT input_points = cloud->points;
+
+		PointT input_point;
+
+		int center_points = 0 ;
 	
 		for ( int i = 0 ; i< (cloud->width) ; i++)
 	    	{				
@@ -479,11 +530,18 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 
 				// Y value might be inverted , check
 		
-			    	if(x_value > min_x_value && x_value < max_x_value && y_value > min_y_value && y_value < max_y_value)
+			    	if(x_value > min_x_value && x_value < max_x_value && y_value > min_y_value && y_value < max_y_value
+				   && z_value > min_z_value && z_value < max_z_value)
 				{
-					cropped_cloud_data.r_avg += r_value;
-					cropped_cloud_data.g_avg += g_value;
-					cropped_cloud_data.b_avg += b_value;
+					
+					if(x_value > min_center_x_value && x_value < max_center_x_value && y_value > min_center_y_value && y_value < max_center_y_value)
+					{
+						cropped_cloud_data.r_avg += r_value;
+						cropped_cloud_data.g_avg += g_value;
+						cropped_cloud_data.b_avg += b_value;
+						center_points++;
+					}
+
 					cropped_cloud_data.cloud_ptr->points.push_back(input_point);
 					cropped_cloud_data.number_of_points++;
 				}
@@ -493,22 +551,22 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 		if ( cropped_cloud_data.number_of_points > 5 )
 		{
 
-			cropped_cloud_data.r_avg /= cropped_cloud_data.number_of_points;
-			cropped_cloud_data.g_avg /= cropped_cloud_data.number_of_points;
-			cropped_cloud_data.b_avg /= cropped_cloud_data.number_of_points;
+			cropped_cloud_data.r_avg /= center_points;
+			cropped_cloud_data.g_avg /= center_points;
+			cropped_cloud_data.b_avg /= center_points;
 
 			Eigen::Vector4f cropped_cloud_centroid;
 
 			pcl::compute3DCentroid<PointT> (*cropped_cloud_data.cloud_ptr, cropped_cloud_centroid);
 
-			cropped_cloud_data.x_center = ref_cloud_centroid[0];
-			cropped_cloud_data.y_center = ref_cloud_centroid[1];
-			cropped_cloud_data.z_center = ref_cloud_centroid[2];
+			cropped_cloud_data.x_center = cropped_cloud_centroid[0];
+			cropped_cloud_data.y_center = cropped_cloud_centroid[1];
+			cropped_cloud_data.z_center = cropped_cloud_centroid[2];
 
 			PointT point_min;
 			PointT point_max;
 
-			pcl::getMinMax3D(*ref_cloud_data.cloud_ptr,point_min,point_max);
+			pcl::getMinMax3D(*cropped_cloud_data.cloud_ptr,point_min,point_max);
 
 			cropped_cloud_data.length = abs( point_max.x - point_min.x );
 			cropped_cloud_data.breadth = abs( point_max.z - point_min.z );
@@ -528,20 +586,106 @@ ApproxNearestPairPointCloudCoherence<RefPointType>::Ptr coherence;
 	
 	}
 
-	void track()
+	bool track()
 	{
-		//Declare the minimum point to crop the input cloud
 
-		Eigen::Vector4f minPoint; 
-		minPoint[0]=PrevX+MinXOffset;  // define minimum point x
-		minPoint[1]=PrevY+MinYOffset;  // define minimum point y
-		minPoint[2]=PrevZ+MinZOffset;  // define minimum point z 
+		PointCloudDataT tracked_cloud_data = crop_cloud(input_point_cloud, prev_x, prev_y, prev_z);
 
-		//Declare the maximum point to crop the input cloud
-		Eigen::Vector4f maxPoint;
-		maxPoint[0]=PrevX+MaxXOffset;  // define max point x
-		maxPoint[1]=PrevY+MaxYOffset;  // define max point y
-		maxPoint[2]=PrevZ+MaxZOffset;  // define max point z
+		if(tracked_cloud_data.is_valid)
+		{
+			particle_tracker->setInputCloud(tracked_cloud_data.cloud_ptr);
+			particle_tracker->compute();
+
+		}
+		else
+		{
+			reset();
+			return false;
+		}
+
+		if(coherence->target_input_->size() == 0)
+		{
+			reset();
+			return false;	
+		}
+	
+		ParticleCloudPtrT particles = particle_tracker->getParticles ();
+
+	        for (size_t i = 0; i < particles->points.size (); i++)
+		{
+			PointT point;
+			point.x = particles->points[i].x;
+			point.y = particles->points[i].y;
+			point.z = particles->points[i].z;
+			object_particle_cloud->points.push_back (point);
+		}
+
+
+	       sensor_msgs::PointCloud2::Ptr object_cloud (new sensor_msgs::PointCloud2); 
+	       pcl::toROSMsg ( *object_particle_cloud, *object_cloud);
+	       object_cloud->header.frame_id = "world";
+	       object_cloud_pub.publish(object_cloud);
+
+	       sensor_msgs::PointCloud2::Ptr tracked_cloud (new sensor_msgs::PointCloud2); 
+	       pcl::toROSMsg ( *tracked_cloud_data.cloud_ptr, *tracked_cloud);
+	       tracked_cloud->header.frame_id = "world";
+	       tracked_cloud_pub.publish(tracked_cloud);
+	 
+	       ParticleT result = particle_tracker->getResult ();
+	       Eigen::Affine3f transformation = particle_tracker->toEigenMatrix (result);
+
+	       transformation.translation () += Eigen::Vector3f (0.0f, 0.0f, -0.005f);
+	       PointCloudPtrT result_cloud (new PointCloudT ());
+	       pcl::transformPointCloud<PointT> (*(particle_tracker->getReferenceCloud ()), *result_cloud, transformation);
+	  
+	       Eigen::Vector4f c;
+	       pcl::compute3DCentroid<PointT> (*result_cloud, c);
+
+	       prev_x = c[0];
+	       prev_y = c[1];
+	       prev_z = c[2];
+
+	       object_centroid_msg.point.x = c[0];
+	       object_centroid_msg.point.y = c[1];
+	       object_centroid_msg.point.z = c[2];
+	       object_centroid_msg.header.frame_id = "world";
+	       object_centroid_msg.header.stamp = ros::Time::now();
+
+	       object_centroid_pub.publish(object_centroid_msg);
+
+
+	       //TODO Relocalization
+	       double pixeldiff = abs(tracked_cloud_data.r_avg - target_cloud_data.r_avg) + abs(tracked_cloud_data.g_avg - target_cloud_data.g_avg)
+				   + abs(tracked_cloud_data.b_avg - target_cloud_data.b_avg) ;
+
+
+	}
+
+	void reset()
+	{
+		particle_tracker->resetTracking();
+		object_detected = false;
+		prev_x=0.0;
+		prev_y=0.0;
+		prev_z=0.0;
+		return;
+
+	}
+
+	void run()
+	{
+		if(!object_detected)
+		{
+			if(object_detection())
+			{
+				target_point_cloud = target_cloud_data.cloud_ptr;
+				init_particle_filter();
+			}
+		}
+		else
+		{
+			track();
+		}
 
 
 	}
@@ -555,7 +699,7 @@ int main( int argc, char** argv )
     ros::init(argc, argv, "object_tracker_node");
 
    // ros::NodeHandle nh;
-    object_tracker hand_tracker("bottom", NumberOfFeaturesToUse, FocalLength_X, FocalLength_Y, PrincipalPoint_X, PrincipalPoint_Y, Distortion);
+    //object_tracker hand_tracker("bottom", NumberOfFeaturesToUse, FocalLength_X, FocalLength_Y, PrincipalPoint_X, PrincipalPoint_Y, Distortion);
     ros::spin();
     return 0;
 }
